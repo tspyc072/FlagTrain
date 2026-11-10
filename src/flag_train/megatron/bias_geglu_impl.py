@@ -41,7 +41,9 @@ from flag_train.utils import triton_lang_extension as tle
 logger = logging.getLogger(__name__)
 
 _NUM_WARPS = 4
-_BLOCK_SIZE = 1024
+# Ascend benefits from covering more columns per iteration; blocks of 16384
+# or larger fail MLIR compilation in the validated CANN environment.
+_BLOCK_SIZE = 8192 if runtime_device.vendor_name == "ascend" else 1024
 _MIN_BLOCK_SIZE = 16
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 

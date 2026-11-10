@@ -17,8 +17,10 @@ For standard GEGLU, the baseline is Megatron-LM's ``bias_geglu_impl`` when
 installed. Its forward helpers use ``jit_fuser``, which is ``torch.compile``
 on supported PyTorch versions. QuickGEGLU cases, and machines without
 Megatron-LM, use the vendored forward implementation at the end of this file,
-also compiled with ``torch.compile``. Thus every row is compared against a
-compiled native implementation rather than eager PyTorch.
+also compiled with ``torch.compile``. If a vendor backend cannot compile a
+baseline, the affected variant explicitly falls back to the equivalent eager
+formula and emits a warning. Such results must be reported as eager-baseline
+measurements rather than compared directly with compiled-baseline results.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
@@ -144,6 +146,23 @@ _VARIANTS = {
 }
 
 
+def bias_geglu_ref(x, bias=None, activation="gelu", linear_offset=0.0):
+    """Eager formula used only when a compiled baseline is unavailable."""
+    y = x if bias is None else x + bias
+    gate, linear = torch.chunk(y, 2, dim=-1)
+    if activation == "quick_gelu":
+        return (gate * torch.sigmoid(1.702 * gate)) * (linear + linear_offset)
+    return (
+        gate
+        * 0.5
+        * (1.0 + torch.tanh(0.79788456 * gate * (1 + 0.044715 * gate * gate)))
+    ) * linear
+
+
+# Remember failed variants so Dynamo does not retry compilation for every row.
+_EAGER_BASELINE_VARIANTS = set()
+
+
 def bias_geglu_input_fn(shape, dtype, device):
     x = torch.randn(shape, dtype=dtype, device=device)
     bias = torch.randn((shape[-1],), dtype=dtype, device=device)
@@ -152,10 +171,24 @@ def bias_geglu_input_fn(shape, dtype, device):
 
 
 def torch_op(x, bias, variant):
-    """Compiled Megatron baseline for GEGLU; vendored compiled QuickGEGLU."""
-    if variant == "gelu":
-        return _BASELINE_IMPL(x, bias)
-    return _vendored_bias_geglu_impl(x, bias, **_VARIANTS[variant])
+    """Use the compiled baseline, with an explicit per-variant eager fallback."""
+    if variant in _EAGER_BASELINE_VARIANTS:
+        return bias_geglu_ref(x, bias, **_VARIANTS[variant])
+
+    try:
+        if variant == "gelu":
+            return _BASELINE_IMPL(x, bias)
+        return _vendored_bias_geglu_impl(x, bias, **_VARIANTS[variant])
+    except Exception as exc:
+        _EAGER_BASELINE_VARIANTS.add(variant)
+        warnings.warn(
+            f"compiled baseline failed for {variant!r}: "
+            f"{type(exc).__name__}: {exc}; using the eager formula for all "
+            "subsequent rows of this variant",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return bias_geglu_ref(x, bias, **_VARIANTS[variant])
 
 
 def train_op(x, bias, variant):
