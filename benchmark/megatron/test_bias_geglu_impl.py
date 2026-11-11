@@ -13,21 +13,20 @@
 # limitations under the License.
 """Performance benchmark for bias_geglu_impl.
 
-For standard GEGLU, the baseline is Megatron-LM's ``bias_geglu_impl`` when
-installed. Its forward helpers use ``jit_fuser``, which is ``torch.compile``
-on supported PyTorch versions. QuickGEGLU cases, and machines without
-Megatron-LM, use the vendored forward implementation at the end of this file,
-also compiled with ``torch.compile``. Thus every row is compared against a
-compiled native implementation rather than eager PyTorch.
+The baseline is Megatron-LM's ``bias_geglu_impl`` when installed. Its forward
+helpers use ``jit_fuser``, which is ``torch.compile`` on supported PyTorch
+versions. Machines without Megatron-LM use the vendored forward implementation
+at the end of this file, also compiled with ``torch.compile``. Thus every row
+is compared against a compiled native implementation rather than eager
+PyTorch.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
-below. One table covers standard GEGLU, QuickGEGLU, and QuickGEGLU with a
-linear offset. The operator is forward-only, so there are no backward cases.
+below. The operator is forward-only, so there are no backward cases.
 
-``torch.compile`` recompiles per shape/dtype/variant pattern. The default
-Dynamo recompile limit is smaller than this benchmark's case count, so the
-module raises it; otherwise the baseline could silently fall back to eager.
+``torch.compile`` recompiles per shape/dtype pattern. The default Dynamo
+recompile limit is smaller than this benchmark's case count, so the module
+raises it; otherwise the baseline could silently fall back to eager.
 """
 
 import importlib.metadata
@@ -52,8 +51,8 @@ _CORE_SHAPES = [
     (256, 32768),
 ]
 
-# Enough variants for 7 shapes x 3 activations x 3 dtypes of forward cases
-# without Dynamo falling back to eager halfway through the suite.
+# Enough capacity for 7 shapes x 3 dtypes without Dynamo falling back to eager
+# halfway through the suite.
 _DYNAMO_RECOMPILE_LIMIT = 128
 
 
@@ -132,40 +131,25 @@ class BiasGegluImplBenchmark(base.GenericBenchmark):
         self.shapes = list(_CORE_SHAPES)
 
 
-# Each label becomes part of the benchmark row. The kwargs are accepted by
-# both the FlagTrain operator and the vendored baseline.
-_VARIANTS = {
-    "gelu": {"activation": "gelu"},
-    "quick_gelu": {"activation": "quick_gelu"},
-    "quick_gelu_offset": {
-        "activation": "quick_gelu",
-        "linear_offset": 0.5,
-    },
-}
-
-
 def bias_geglu_input_fn(shape, dtype, device):
     x = torch.randn(shape, dtype=dtype, device=device)
     bias = torch.randn((shape[-1],), dtype=dtype, device=device)
-    for variant in _VARIANTS:
-        yield (x, bias, variant)
+    yield (x, bias)
 
 
-def torch_op(x, bias, variant):
-    """Compiled Megatron baseline for GEGLU; vendored compiled QuickGEGLU."""
-    if variant == "gelu":
-        return _BASELINE_IMPL(x, bias)
-    return _vendored_bias_geglu_impl(x, bias, **_VARIANTS[variant])
+def torch_op(x, bias):
+    """Compiled Megatron-LM baseline, or the vendored compiled fallback."""
+    return _BASELINE_IMPL(x, bias)
 
 
-def train_op(x, bias, variant):
+def train_op(x, bias):
     """The operator under test."""
-    return flag_train.megatron.bias_geglu_impl(x, bias, **_VARIANTS[variant])
+    return flag_train.megatron.bias_geglu_impl(x, bias)
 
 
 @pytest.mark.bias_geglu_impl
 def test_bias_geglu_impl_perf():
-    """Benchmark all activation variants for every shape in one table."""
+    """Benchmark GEGLU for every shape and dtype in one table."""
     print(f"\nBaseline: {_BASELINE}")
 
     # On Ascend, enable parallel scheduling of all blocks to avoid excessive
@@ -193,7 +177,7 @@ def test_bias_geglu_impl_perf():
 #
 # ``jit_fuser`` is replaced by ``torch.compile``. Autograd and backward-only
 # helpers are omitted because this benchmark measures forward only. The
-# forward formulas are unchanged. This is a performance baseline, not the
+# forward formula is unchanged. This is a performance baseline, not the
 # correctness oracle used by the unit tests.
 # ===========================================================================
 
@@ -209,38 +193,24 @@ def geglu(y):
 
 
 @jit_fuser
-def quick_geglu(y, linear_offset=0.0):
-    """QuickGEGLU: quick_gelu(y1) * (y2 + linear_offset)."""
-    y_1, y_2 = torch.chunk(y, 2, dim=-1)
-    return y_1 * torch.sigmoid(1.702 * y_1) * (y_2 + linear_offset)
-
-
-@jit_fuser
-def _compiled_bias_geglu(y, bias, activation="gelu", linear_offset=0.0):
-    """Compiled bias addition followed by the selected GLU activation."""
+def _compiled_bias_geglu(y, bias):
+    """Compiled bias addition followed by GEGLU."""
     if bias is not None:
         y = y + bias
-    if activation == "quick_gelu":
-        return quick_geglu(y, linear_offset)
     return geglu(y)
 
 
-def _vendored_bias_geglu_impl(
-    input,
-    bias,
-    activation="gelu",
-    linear_offset=0.0,
-):
+def _vendored_bias_geglu_impl(input, bias):
     """Vendored forward baseline supporting two- and three-dimensional input."""
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
     flat = input.view(-1, ori_shape[-1])
-    out = _compiled_bias_geglu(flat, bias, activation, linear_offset)
+    out = _compiled_bias_geglu(flat, bias)
     return out if len(ori_shape) == 2 else out.view(*ori_shape[:-1], -1)
 
 
 def _load_baseline():
-    """Load installed Megatron for standard GEGLU, otherwise use the appendix."""
+    """Load installed Megatron-LM, otherwise use the vendored implementation."""
     if _MCORE_VERSION != "not installed":
         try:
             from megatron.core.fusions.fused_bias_geglu import (
@@ -249,16 +219,13 @@ def _load_baseline():
         except ImportError as exc:
             reason = f"megatron-core {_MCORE_VERSION} cannot import it: {exc}"
         else:
-            return installed, (
-                f"megatron-core {_MCORE_VERSION} for gelu; "
-                "vendored compiled implementation for quick_gelu"
-            )
+            return installed, f"megatron-core {_MCORE_VERSION}"
     else:
         reason = "Megatron-LM is not installed"
 
     warnings.warn(
         f"{reason}; using the vendored compiled implementation as the "
-        "standard GEGLU benchmark baseline",
+        "GEGLU benchmark baseline",
         RuntimeWarning,
         stacklevel=2,
     )

@@ -14,9 +14,8 @@
 
 ops:
 - id: bias_geglu_impl
-  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU or
-    QuickGELU gating in one kernel. Forward only; the activation variant is selected
-    by arguments.'
+  description: 'Bias plus GeGLU fusion: bias add, gate/linear split, and GELU
+    gating in one kernel. Forward only.'
   for:
   - bias_geglu_impl
   labels:

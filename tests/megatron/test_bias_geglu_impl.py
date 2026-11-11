@@ -14,22 +14,15 @@
 """Correctness tests for fused bias + GeGLU (forward only).
 
 The reference is Megatron-LM's own ``bias_geglu_impl`` when megatron-core is
-installed, so the kernel is checked against the implementation it ports.
-Without megatron-core, and for the quick_gelu variant (whose public Megatron
-entry point takes different arguments), the reference is ``bias_geglu_ref``:
-the eager formula Megatron-LM checks its own fusion against, the tanh GELU (or
-quick_gelu) of the gate half times the linear half, with the bias added by
-ordinary broadcasting. That formula covers every variant and is always
-available, so the suite still runs without Megatron-LM.
+installed. Otherwise, ``bias_geglu_ref`` evaluates the eager tanh-GELU formula
+with the bias added by ordinary broadcasting.
 
 Under ``--ref cpu`` the operands are moved to the CPU and upcast, so the
 comparison is against a higher-precision CPU result. Tolerances are
 ``train_assert_close``'s defaults.
 
-Only the forward output is checked: the backward is a separate operator. The
-``fp8_input_store`` and ``cpu_offload_input`` flags stay for Megatron-LM
-signature compatibility but have nothing left to save, so passing either one is
-expected to raise. ``bias`` must have the same dtype as ``input``.
+Only the forward output is checked: the backward is a separate operator.
+``bias`` must have the same dtype as ``input``.
 """
 
 import pytest
@@ -99,8 +92,8 @@ _SHAPES = [
     (4, 7, 32),
 ]
 
-# Bias is orthogonal to the shapes and variants below, so it is sampled on a
-# few representative cases only.
+# Bias is orthogonal to the shapes above, so it is sampled on representative
+# cases only.
 _BIAS_SHAPES = [
     (1, 2),
     (17, 32),
@@ -108,19 +101,10 @@ _BIAS_SHAPES = [
     (4, 7, 32),
 ]
 
-# name -> operator kwargs. quick_offset also exercises linear_offset.
-_VARIANTS = {
-    "gelu": {"activation": "gelu"},
-    "quick": {"activation": "quick_gelu"},
-    "quick_offset": {"activation": "quick_gelu", "linear_offset": 0.5},
-}
 
-
-def bias_geglu_ref(x, bias=None, activation="gelu", linear_offset=0.0):
+def bias_geglu_ref(x, bias=None):
     y = x if bias is None else x + bias
     gate, linear = torch.chunk(y, 2, dim=-1)
-    if activation == "quick_gelu":
-        return (gate * torch.sigmoid(1.702 * gate)) * (linear + linear_offset)
     # tanh approximation of GELU, the same constants as Megatron-LM.
     return (
         gate
@@ -139,37 +123,30 @@ def _assert_close(actual, expected, dtype):
     utils.train_assert_close(utils.to_reference(actual), expected, dtype)
 
 
-def _expected_output(x, bias, **kwargs):
-    """Megatron-LM when available for the plain GELU path, else the formula.
+def _expected_output(x, bias):
+    """Use Megatron-LM when available, otherwise use the eager formula.
 
     The Megatron side gets contiguous operands: its ``input.view(-1, hidden)``
     rejects the transposed inputs this suite deliberately feeds the operator.
-    Its public entry point has no quick_gelu switch, so that variant always
-    compares against the eager formula. Empty inputs also use the formula:
-    Megatron restores a rank-3 result with ``view(..., -1)``, which is
-    ambiguous when the output has zero elements.
+    Empty inputs also use the formula: Megatron restores a rank-3 result with
+    ``view(..., -1)``, which is ambiguous when the output has zero elements.
     """
-    if (
-        _megatron_impl is not None
-        and not utils.TO_CPU
-        and x.numel() > 0
-        and kwargs.get("activation", "gelu") == "gelu"
-    ):
+    if _megatron_impl is not None and not utils.TO_CPU and x.numel() > 0:
         return _megatron_impl(
             x.contiguous(),
             None if bias is None else bias.contiguous(),
         )
-    return bias_geglu_ref(x, bias, **kwargs)
+    return bias_geglu_ref(x, bias)
 
 
-def _check_bias_geglu(x, bias, **kwargs):
+def _check_bias_geglu(x, bias):
     dtype = x.dtype
-    y = flag_train.megatron.bias_geglu_impl(x, bias, **kwargs)
+    y = flag_train.megatron.bias_geglu_impl(x, bias)
     assert y.shape[-1] * 2 == x.shape[-1]
     assert y.shape[:-1] == x.shape[:-1]
     assert y.dtype == dtype
 
-    expected = _expected_output(_reference(x), _reference(bias), **kwargs)
+    expected = _expected_output(_reference(x), _reference(bias))
     _assert_close(y, expected, dtype)
 
 
@@ -193,49 +170,25 @@ def test_bias_geglu_impl_bias(shape, dtype):
 
 
 @pytest.mark.bias_geglu_impl
-@pytest.mark.parametrize("variant", list(_VARIANTS))
-@pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
-def test_bias_geglu_impl_variants(variant, dtype):
-    utils.init_seed(1)
-    x = torch.randn((16, 64), dtype=dtype, device=flag_train.device)
-    _check_bias_geglu(x, None, **_VARIANTS[variant])
-
-
-@pytest.mark.bias_geglu_impl
-@pytest.mark.parametrize("variant", list(_VARIANTS))
-def test_bias_geglu_impl_variants_bias(variant):
-    utils.init_seed(1)
-    x = torch.randn((16, 64), dtype=torch.float16, device=flag_train.device)
-    bias = torch.randn((64,), dtype=torch.float16, device=flag_train.device)
-    _check_bias_geglu(x, bias, **_VARIANTS[variant])
-
-
-@pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_geglu_impl_bias_shapes(dtype):
     utils.init_seed(4)
     x = torch.randn((8, 32), dtype=dtype, device=flag_train.device)
     _check_bias_geglu(x, torch.randn((1, 32), dtype=dtype, device=flag_train.device))
     _check_bias_geglu(x, torch.randn((8, 32), dtype=dtype, device=flag_train.device))
-    _check_bias_geglu(
-        x,
-        torch.tensor(0.25, dtype=dtype, device=flag_train.device),
-        activation="quick_gelu",
-    )
+    _check_bias_geglu(x, torch.tensor(0.25, dtype=dtype, device=flag_train.device))
 
 
 @pytest.mark.bias_geglu_impl
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_bias_geglu_impl_large_values(dtype):
-    """Extreme magnitudes: GELU/tanh and quick_gelu/sigmoid saturation."""
+    """Extreme magnitudes: check GELU/tanh saturation."""
     values = [-1000.0, -90.0, -20.0, -1.0, 0.0, 1.0, 20.0, 90.0, 1000.0, -8.0]
     # 10 gate values and 10 linear values.
     data = values + [-1000.0, -4.0, -1.0, 0.0, 0.5, 1.0, 4.0, 20.0, 90.0, 1000.0]
     x = torch.tensor(data, dtype=torch.float32, device=flag_train.device).to(dtype)
     x = x.view(1, -1)
     _check_bias_geglu(x, None)
-    _check_bias_geglu(x, None, activation="quick_gelu")
-    _check_bias_geglu(x, None, activation="quick_gelu", linear_offset=100.0)
 
 
 @pytest.mark.bias_geglu_impl
@@ -255,7 +208,7 @@ def test_bias_geglu_impl_noncontiguous(dtype):
     transposed = cube.transpose(0, 2)
     assert not transposed.is_contiguous()
     assert transposed.shape[-1] % 2 == 0
-    _check_bias_geglu(transposed, None, activation="quick_gelu")
+    _check_bias_geglu(transposed, None)
 
 
 @pytest.mark.bias_geglu_impl
@@ -272,14 +225,6 @@ def test_bias_geglu_impl_rejects_bad_arguments():
         flag_train.megatron.bias_geglu_impl(torch.randn((4, 7), device=device), None)
     with pytest.raises(ValueError, match="CPU"):
         flag_train.megatron.bias_geglu_impl(torch.randn((4, 8)), None)
-    with pytest.raises(ValueError, match="activation"):
-        flag_train.megatron.bias_geglu_impl(x, None, activation="silu")
-    with pytest.raises(ValueError, match="only used by quick_gelu"):
-        flag_train.megatron.bias_geglu_impl(x, None, linear_offset=1.0)
-    with pytest.raises(ValueError, match="finite"):
-        flag_train.megatron.bias_geglu_impl(
-            x, None, activation="quick_gelu", linear_offset=float("inf")
-        )
     with pytest.raises(ValueError, match="broadcast"):
         flag_train.megatron.bias_geglu_impl(x, torch.randn((3,), device=device))
     # An empty input must not skip the bias checks.
@@ -287,11 +232,6 @@ def test_bias_geglu_impl_rejects_bad_arguments():
         flag_train.megatron.bias_geglu_impl(
             torch.empty((0, 8), device=device), torch.randn((3,), device=device)
         )
-    # Forward only: the flags that used to control the saved activations raise.
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.bias_geglu_impl(x, None, fp8_input_store=True)
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        flag_train.megatron.bias_geglu_impl(x, None, cpu_offload_input=True)
 
 
 @pytest.mark.bias_geglu_impl
